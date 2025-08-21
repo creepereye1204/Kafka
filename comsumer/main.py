@@ -1,94 +1,117 @@
 import os
 import json
-import uuid
 import asyncio
+import random
 import datetime as dt
 from typing import Optional, List
 
 from fastapi import FastAPI
-from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer
 from contextlib import asynccontextmanager
-
 from pydantic import BaseModel, EmailStr, Field, ValidationError
 
-
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-DEFAULT_TOPIC = "test-topic"
-
-producer: Optional[AIOKafkaProducer] = None
-consumer_task: Optional[asyncio.Task] = None
+TOPIC = os.getenv("KAFKA_TOPIC", "user-profile")
+GROUP_ID = os.getenv("KAFKA_GROUP_ID", "user-profile-consumer")
+FAILURE_RATE = float(os.getenv("FAILURE_RATE", "0.3"))
+FAIL_MODE = os.getenv("FAIL_MODE", "exception")
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
+BASE_BACKOFF = float(os.getenv("BASE_BACKOFF", "0.3"))
 
 
 class UserProfile(BaseModel):
-    user_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
     username: str = Field(..., min_length=2, max_length=50)
     email: EmailStr
     age: Optional[int] = Field(None, ge=0, le=150)
-    interests: List[str] = Field(default_factory=list)
+    interests: List[str] = []
     is_active: bool = True
-    created_at: dt.datetime = Field(
-        default_factory=lambda: dt.datetime.now(dt.timezone.utc))
+    created_at: dt.datetime
     updated_at: Optional[dt.datetime] = None
 
 
-def to_json_bytes(model: BaseModel) -> bytes:
-
-    try:
-        return model.model_dump_json(exclude_none=True).encode("utf-8")
-    except AttributeError:
-        return model.json(exclude_none=True, ensure_ascii=False).encode("utf-8")
+consumer_task: Optional[asyncio.Task] = None
 
 
-async def start_producer():
-    global producer
-    producer = AIOKafkaProducer(bootstrap_servers=BOOTSTRAP)
-    await producer.start()
+def maybe_fail():
+    if random.random() < FAILURE_RATE:
+        if FAIL_MODE == "crash":
+            print("[FAIL-INJECT] crash: exiting process without commit")
+            os._exit(2)
+        else:
+            print("[FAIL-INJECT] exception: raising error without commit")
+            raise RuntimeError("Injected failure")
 
 
-async def stop_producer():
-    global producer
-    if producer:
-        await producer.stop()
+async def process(profile: UserProfile, meta: dict):
+    maybe_fail()
+    print(
+        f"[CONSUMED] {meta['topic']}[{meta['partition']}]@{meta['offset']} "
+        f"key={meta['key']} username={profile.username} email={profile.email} is_active={profile.is_active} "
+        f"schema={meta.get('schema')} headers={meta.get('headers')}"
+    )
 
 
-async def consume_loop(topic: str):
+async def consume_loop():
     consumer = AIOKafkaConsumer(
-        topic,
+        TOPIC,
         bootstrap_servers=BOOTSTRAP,
-        group_id="fastapi-group",
+        group_id=GROUP_ID,
+        enable_auto_commit=False,
         auto_offset_reset="earliest",
-        enable_auto_commit=True,
+        session_timeout_ms=45000,
+        max_poll_interval_ms=300000,
     )
     await consumer.start()
     try:
         async for msg in consumer:
             raw = msg.value
+            key = msg.key.decode("utf-8") if msg.key else None
+            headers = {k: (v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else v)
+                       for k, v in (msg.headers or [])}
+            schema = headers.get("schema")
+            meta = {
+                "topic": msg.topic,
+                "partition": msg.partition,
+                "offset": msg.offset,
+                "key": key,
+                "schema": schema,
+                "headers": headers,
+            }
             try:
                 data = json.loads(raw.decode("utf-8"))
                 profile = UserProfile(**data)
-                print(
-                    f"[CONSUMED] {msg.topic}:{msg.partition}@{msg.offset} "
-                    f"key={msg.key.decode('utf-8') if msg.key else None} "
-                    f"username={profile.username} email={profile.email} is_active={profile.is_active}"
-                )
             except (json.JSONDecodeError, ValidationError) as e:
-                print(
-                    f"[INVALID_MESSAGE] {msg.topic}:{msg.partition}@{msg.offset} "
-                    f"error={e} raw={raw}"
-                )
+                print(f"[INVALID] {meta} error={e}")
+                await consumer.commit()
+                continue
+            attempt = 0
+            while True:
+                try:
+                    await process(profile, meta)
+                    await consumer.commit()
+                    break
+                except Exception as e:
+                    attempt += 1
+                    if attempt <= MAX_RETRIES:
+                        backoff = BASE_BACKOFF * (2 ** (attempt - 1))
+                        print(
+                            f"[RETRY] attempt={attempt}/{MAX_RETRIES} backoff={backoff:.2f}s error={e}")
+                        await asyncio.sleep(backoff)
+                        continue
+                    else:
+                        print(
+                            f"[FAILED] not committed; will be reprocessed on restart error={e}")
+                        break
     finally:
         await consumer.stop()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await start_producer()
-
-    await asyncio.sleep(1)
     global consumer_task
-    consumer_task = asyncio.create_task(consume_loop(DEFAULT_TOPIC))
+    consumer_task = asyncio.create_task(consume_loop())
     yield
-    await stop_producer()
     if consumer_task:
         consumer_task.cancel()
         try:
@@ -96,39 +119,9 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
-
 app = FastAPI(lifespan=lifespan)
 
 
-@app.get("/")
-async def root():
-    return {"status": "ok"}
-
-
-@app.post("/produce")
-async def produce(profile: UserProfile, topic: str = DEFAULT_TOPIC):
-    
-    assert producer is not None, "Producer not ready"
-
-    value = to_json_bytes(profile)
-    key = profile.user_id.encode("utf-8")
-
-    headers = [
-        ("content-type", b"application/json"),
-        ("schema", b"user-profile-v1"),
-    ]
-
-    md = await producer.send_and_wait(
-        topic,
-        value=value,
-        key=key,
-        headers=headers,
-    )
-
-    return {
-        "status": "sent",
-        "topic": topic,
-        "partition": md.partition,
-        "offset": md.offset,
-        "key": profile.user_id,
-    }
+@app.get("/health")
+async def health():
+    return {"status": "ok", "topic": TOPIC, "group": GROUP_ID}

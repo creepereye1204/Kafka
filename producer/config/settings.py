@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -37,7 +38,20 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'rest_framework',
+    'app',
 ]
+KAFKA_BOOTSTRAP_SERVERS = os.getenv(
+    "KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+KAFKA_DEFAULT_TOPIC = os.getenv("KAFKA_DEFAULT_TOPIC", "user-profile")
+
+KAFKA_PRODUCER_CONFIG = {
+    "linger.ms": 10,
+    "batch.size": 131072,
+    "compression.type": "lz4",
+    "acks": "all",
+    "enable.idempotence": True
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
