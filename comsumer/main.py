@@ -1,22 +1,25 @@
 import os
 import json
 import asyncio
-import random
 import datetime as dt
 from typing import Optional, List
 
 from fastapi import FastAPI
 from aiokafka import AIOKafkaConsumer
+from aiokafka.structs import TopicPartition
 from contextlib import asynccontextmanager
 from pydantic import BaseModel, EmailStr, Field, ValidationError
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+logger = logging.getLogger("consumer")
 
 BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "user-profile")
 GROUP_ID = os.getenv("KAFKA_GROUP_ID", "user-profile-consumer")
-FAILURE_RATE = float(os.getenv("FAILURE_RATE", "0.3"))
-FAIL_MODE = os.getenv("FAIL_MODE", "exception")
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
-BASE_BACKOFF = float(os.getenv("BASE_BACKOFF", "0.3"))
 
 
 class UserProfile(BaseModel):
@@ -33,22 +36,11 @@ class UserProfile(BaseModel):
 consumer_task: Optional[asyncio.Task] = None
 
 
-def maybe_fail():
-    if random.random() < FAILURE_RATE:
-        if FAIL_MODE == "crash":
-            print("[FAIL-INJECT] crash: exiting process without commit")
-            os._exit(2)
-        else:
-            print("[FAIL-INJECT] exception: raising error without commit")
-            raise RuntimeError("Injected failure")
-
-
 async def process(profile: UserProfile, meta: dict):
-    maybe_fail()
-    print(
-        f"[CONSUMED] {meta['topic']}[{meta['partition']}]@{meta['offset']} "
-        f"key={meta['key']} username={profile.username} email={profile.email} is_active={profile.is_active} "
-        f"schema={meta.get('schema')} headers={meta.get('headers')}"
+    logger.info(
+        "[PROCESS] %s[%s]@%s key=%s user_id=%s username=%s email=%s is_active=%s",
+        meta['topic'], meta['partition'], meta['offset'],
+        meta['key'], profile.user_id, profile.username, profile.email, profile.is_active
     )
 
 
@@ -63,61 +55,95 @@ async def consume_loop():
         max_poll_interval_ms=300000,
     )
     await consumer.start()
+    logger.info("[START] consuming topic=%s group=%s bootstrap=%s",
+                TOPIC, GROUP_ID, BOOTSTRAP)
     try:
         async for msg in consumer:
-            raw = msg.value
-            key = msg.key.decode("utf-8") if msg.key else None
-            headers = {k: (v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else v)
-                       for k, v in (msg.headers or [])}
-            schema = headers.get("schema")
+            raw_text = msg.value.decode("utf-8", errors="replace")
+            key = msg.key.decode(
+                "utf-8", errors="replace") if msg.key else None
+            headers = {
+                k: (v.decode("utf-8", errors="replace")
+                    if isinstance(v, (bytes, bytearray)) else v)
+                for k, v in (msg.headers or [])
+            }
             meta = {
                 "topic": msg.topic,
                 "partition": msg.partition,
                 "offset": msg.offset,
                 "key": key,
-                "schema": schema,
                 "headers": headers,
+                "schema": headers.get("schema"),
             }
+            logger.info(
+                "[RECV] %s[%s]@%s key=%s headers=%s raw=%s",
+                msg.topic, msg.partition, msg.offset, key, headers, raw_text
+            )
+
+            valid_profile: Optional[UserProfile] = None
             try:
-                data = json.loads(raw.decode("utf-8"))
-                profile = UserProfile(**data)
+                data = json.loads(raw_text)
+                valid_profile = UserProfile(**data)
+                logger.info("[VALID] username=%s email=%s",
+                            valid_profile.username, valid_profile.email)
             except (json.JSONDecodeError, ValidationError) as e:
-                print(f"[INVALID] {meta} error={e}")
-                await consumer.commit()
-                continue
-            attempt = 0
-            while True:
+                logger.warning("[INVALID] %s error=%s", meta, e)
+
+            if valid_profile is not None:
                 try:
-                    await process(profile, meta)
-                    await consumer.commit()
-                    break
+                    await process(valid_profile, meta)
                 except Exception as e:
-                    attempt += 1
-                    if attempt <= MAX_RETRIES:
-                        backoff = BASE_BACKOFF * (2 ** (attempt - 1))
-                        print(
-                            f"[RETRY] attempt={attempt}/{MAX_RETRIES} backoff={backoff:.2f}s error={e}")
-                        await asyncio.sleep(backoff)
-                        continue
-                    else:
-                        print(
-                            f"[FAILED] not committed; will be reprocessed on restart error={e}")
-                        break
+                    logger.exception("[PROCESS-ERROR] %s", e)
+
+            tp = TopicPartition(msg.topic, msg.partition)
+            try:
+                before = await consumer.committed(tp)
+            except Exception:
+                before = None
+
+            try:
+                await consumer.commit()
+                after = await consumer.committed(tp)
+                logger.info(
+                    "[COMMIT] %s[%s] processed_offset=%s committed_before=%s committed_after=%s next_should_be=%s",
+                    msg.topic, msg.partition, msg.offset, before, after, msg.offset + 1
+                )
+            except Exception as e:
+                logger.exception(
+                    "[COMMIT-ERROR] commit failed; continue anyway error=%s", e)
+    except Exception as e:
+        logger.exception("[FATAL] consume_loop crashed: %s", e)
     finally:
         await consumer.stop()
+        logger.info("[STOP] consumer stopped")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global consumer_task
-    consumer_task = asyncio.create_task(consume_loop())
-    yield
-    if consumer_task:
-        consumer_task.cancel()
+    logger.info("[LIFE] startup begin")
+
+    async def runner():
         try:
-            await consumer_task
+            await consume_loop()
         except asyncio.CancelledError:
-            pass
+            logger.info("[TASK] consumer cancelled")
+            raise
+        except Exception as e:
+            logger.exception("[TASK] consumer crashed: %s", e)
+
+    global consumer_task
+    consumer_task = asyncio.create_task(runner())
+    try:
+        yield
+    finally:
+        logger.info("[LIFE] shutdown begin")
+        if consumer_task:
+            consumer_task.cancel()
+            try:
+                await consumer_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("[LIFE] shutdown done")
 
 app = FastAPI(lifespan=lifespan)
 
