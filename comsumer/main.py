@@ -149,5 +149,5 @@ app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/health")
-async def health():
+async def health() -> None:
     return {"status": "ok", "topic": TOPIC, "group": GROUP_ID}
